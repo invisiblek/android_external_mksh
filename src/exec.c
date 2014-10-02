@@ -1,8 +1,8 @@
-/*	$OpenBSD: exec.c,v 1.49 2009/01/29 23:27:26 jaredy Exp $	*/
+/*	$OpenBSD: exec.c,v 1.50 2013/06/10 21:09:27 millert Exp $	*/
 
 /*-
  * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
- *		 2011, 2012, 2013
+ *		 2011, 2012, 2013, 2014
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -23,7 +23,7 @@
 
 #include "sh.h"
 
-__RCSID("$MirOS: src/bin/mksh/exec.c,v 1.116 2013/02/17 05:40:15 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/exec.c,v 1.132 2014/06/24 18:38:31 tg Exp $");
 
 #ifndef MKSH_DEFAULT_EXECSHELL
 #define MKSH_DEFAULT_EXECSHELL	"/bin/sh"
@@ -106,7 +106,7 @@ execute(struct op * volatile t,
 			/* set variable to its expanded value */
 			z = strlen(cp) + 1;
 			if (notoktomul(z, 2) || notoktoadd(z * 2, n))
-				internal_errorf(Toomem, (unsigned long)-1);
+				internal_errorf(Toomem, (size_t)-1);
 			dp = alloc(z * 2 + n, ATEMP);
 			memcpy(dp, t->vars[0], n);
 			t->vars[0] = dp;
@@ -138,14 +138,6 @@ execute(struct op * volatile t,
 			/* Allow option parsing (bizarre, but POSIX) */
 			timex_hook(t, &up);
 		ap = (const char **)up;
-		if (Flag(FXTRACE) && ap[0]) {
-			shf_puts(substitute(str_val(global("PS4")), 0),
-			    shl_out);
-			for (i = 0; ap[i]; i++)
-				shf_fprintf(shl_out, "%s%c", ap[i],
-				    ap[i + 1] ? ' ' : '\n');
-			shf_flush(shl_out);
-		}
 		if (ap[0])
 			tp = findcom(ap[0], FC_BI|FC_FUNC);
 	}
@@ -305,10 +297,12 @@ execute(struct op * volatile t,
 	case TAND:
 		rv = execute(t->left, XERROK, xerrok);
 		if ((rv == 0) == (t->type == TAND))
-			rv = execute(t->right, XERROK, xerrok);
-		flags |= XERROK;
-		if (xerrok)
-			*xerrok = 1;
+			rv = execute(t->right, flags & XERROK, xerrok);
+		else {
+			flags |= XERROK;
+			if (xerrok)
+				*xerrok = 1;
+		}
 		break;
 
 	case TBANG:
@@ -335,6 +329,7 @@ execute(struct op * volatile t,
 	case TFOR:
 	case TSELECT: {
 		volatile bool is_first = true;
+
 		ap = (t->vars == NULL) ? e->loc->argv + 1 :
 		    (const char **)eval((const char **)t->vars,
 		    DOBLANK | DOGLOB | DOTILDE);
@@ -467,7 +462,7 @@ execute(struct op * volatile t,
 	if (vp_pipest->flag & INT_L) {
 		unset(vp_pipest, 1);
 		vp_pipest->flag = DEFINED | ISSET | INTEGER | RDONLY |
-		    ARRAY | INT_U;
+		    ARRAY | INT_U | INT_L;
 		vp_pipest->val.i = rv;
 	}
 
@@ -609,19 +604,15 @@ comexec(struct op *t, struct tbl * volatile tp, const char **ap,
 				/* go on, use the builtin */
 				break;
 #endif
-#if !defined(MKSH_SMALL)
 		} else if (tp->val.f == c_trap) {
 			t->u.evalflags &= ~DOTCOMEXEC;
 			break;
-#endif
 		} else
 			break;
 		tp = findcom(ap[0], fcflags & (FC_BI|FC_FUNC));
 	}
-#if !defined(MKSH_SMALL)
 	if (t->u.evalflags & DOTCOMEXEC)
 		flags |= XEXEC;
-#endif
 	l_expand = e->loc;
 	if (keepasn_ok && (!ap[0] || (tp && (tp->flag & KEEPASN))))
 		type_flags = 0;
@@ -639,25 +630,42 @@ comexec(struct op *t, struct tbl * volatile tp, const char **ap,
 	l_assign = e->loc;
 	if (Flag(FEXPORT))
 		type_flags |= EXPORT;
+	if (Flag(FXTRACE))
+		change_xtrace(2, false);
 	for (i = 0; t->vars[i]; i++) {
 		/* do NOT lookup in the new var/fn block just created */
 		e->loc = l_expand;
 		cp = evalstr(t->vars[i], DOASNTILDE);
 		e->loc = l_assign;
-		/* but assign in there as usual */
-
 		if (Flag(FXTRACE)) {
-			if (i == 0)
-				shf_puts(substitute(str_val(global("PS4")), 0),
-				    shl_out);
-			shf_fprintf(shl_out, "%s%c", cp,
-			    t->vars[i + 1] ? ' ' : '\n');
-			if (!t->vars[i + 1])
-				shf_flush(shl_out);
+			const char *ccp;
+
+			ccp = skip_varname(cp, true);
+			if (*ccp == '+')
+				++ccp;
+			if (*ccp == '=')
+				++ccp;
+			shf_write(cp, ccp - cp, shl_xtrace);
+			print_value_quoted(shl_xtrace, ccp);
+			shf_putc(' ', shl_xtrace);
 		}
+		/* but assign in there as usual */
 		typeset(cp, type_flags, 0, 0, 0);
 		if (bourne_function_call && !(type_flags & EXPORT))
-			typeset(cp, LOCAL|LOCAL_COPY|EXPORT, 0, 0, 0);
+			typeset(cp, LOCAL | LOCAL_COPY | EXPORT, 0, 0, 0);
+	}
+
+	if (Flag(FXTRACE)) {
+		change_xtrace(2, false);
+		if (ap[rv = 0]) {
+ xtrace_ap_loop:
+			print_value_quoted(shl_xtrace, ap[rv]);
+			if (ap[++rv]) {
+				shf_putc(' ', shl_xtrace);
+				goto xtrace_ap_loop;
+			}
+		}
+		change_xtrace(1, false);
 	}
 
 	if ((cp = *ap) == NULL) {
@@ -700,10 +708,9 @@ comexec(struct op *t, struct tbl * volatile tp, const char **ap,
 				break;
 			}
 			if (include(tp->u.fpath, 0, NULL, false) < 0) {
-				rv = errno;
 				warningf(true, "%s: %s %s %s: %s", cp,
 				    "can't open", "function definition file",
-				    tp->u.fpath, cstrerror(rv));
+				    tp->u.fpath, cstrerror(errno));
 				rv = 127;
 				break;
 			}
@@ -740,9 +747,9 @@ comexec(struct op *t, struct tbl * volatile tp, const char **ap,
 			getopts_reset(1);
 		}
 
-		old_xflag = Flag(FXTRACE);
-		Flag(FXTRACE) |= tp->flag & TRACE ? 1 : 0;
-
+		old_xflag = Flag(FXTRACE) ? 1 : 0;
+		change_xtrace((Flag(FXTRACEREC) ? old_xflag : 0) |
+		    ((tp->flag & TRACE) ? 1 : 0), false);
 		old_inuse = tp->flag & FINUSE;
 		tp->flag |= FINUSE;
 
@@ -751,9 +758,11 @@ comexec(struct op *t, struct tbl * volatile tp, const char **ap,
 			execute(tp->val.t, flags & XERROK, NULL);
 			i = LRETURN;
 		}
+
 		kshname = old_kshname;
-		Flag(FXTRACE) = old_xflag;
+		change_xtrace(old_xflag, false);
 		tp->flag = (tp->flag & ~FINUSE) | old_inuse;
+
 		/*
 		 * Were we deleted while executing? If so, free the
 		 * execution tree. TODO: Unfortunately, the table entry
@@ -803,7 +812,7 @@ comexec(struct op *t, struct tbl * volatile tp, const char **ap,
 
 		/* set $_ to programme's full path */
 		/* setstr() can't fail here */
-		setstr(typeset("_", LOCAL|EXPORT, 0, INTEGER, 0),
+		setstr(typeset("_", LOCAL | EXPORT, 0, INTEGER, 0),
 		    tp->val.s, KSH_RETURN_ERROR);
 
 		if (flags&XEXEC) {
@@ -856,7 +865,7 @@ scriptexec(struct op *tp, const char **ap)
 	*tp->args-- = tp->str;
 
 #ifndef MKSH_SMALL
-	if ((fd = open(tp->str, O_RDONLY)) >= 0) {
+	if ((fd = open(tp->str, O_RDONLY | O_BINARY)) >= 0) {
 		/* read first MAXINTERP octets from file */
 		if (read(fd, buf, sizeof(buf)) <= 0)
 			/* read error -> no good */
@@ -871,14 +880,14 @@ scriptexec(struct op *tp, const char **ap)
 		fd = (char *)cp - buf;		/* either 0 or (if BOM) 3 */
 
 		/* scan for newline (or CR) or NUL _before_ end of buffer */
-		while ((char *)cp < (buf + sizeof(buf)))
+		while ((size_t)((char *)cp - buf) < sizeof(buf))
 			if (*cp == '\0' || *cp == '\n' || *cp == '\r') {
 				*cp = '\0';
 				break;
 			} else
 				++cp;
 		/* if the shebang line is longer than MAXINTERP, bail out */
-		if ((char *)cp >= (buf + sizeof(buf)))
+		if ((size_t)((char *)cp - buf) >= sizeof(buf))
 			goto noshebang;
 
 		/* restore begin of shebang position (buf+0 or buf+3) */
@@ -910,6 +919,10 @@ scriptexec(struct op *tp, const char **ap)
 				*tp->args-- = (char *)cp;
 		}
  noshebang:
+		if (buf[0] == 0x7F && buf[1] == 'E' && buf[2] == 'L' &&
+		    buf[3] == 'F')
+			errorf("%s: not executable: %d-bit ELF file", tp->str,
+			    32 * ((uint8_t)buf[4]));
 		fd = buf[0] << 8 | buf[1];
 		if ((fd == /* OMAGIC */ 0407) ||
 		    (fd == /* NMAGIC */ 0410) ||
@@ -918,7 +931,6 @@ scriptexec(struct op *tp, const char **ap)
 		    (fd == /* ECOFF_I386 */ 0x4C01) ||
 		    (fd == /* ECOFF_M68K */ 0x0150 || fd == 0x5001) ||
 		    (fd == /* ECOFF_SH */   0x0500 || fd == 0x0005) ||
-		    (fd == 0x7F45 && buf[2] == 'L' && buf[3] == 'F') ||
 		    (fd == /* "MZ" */ 0x4D5A) ||
 		    (fd == /* gzip */ 0x1F8B))
 			errorf("%s: not executable: magic %04X", tp->str, fd);
@@ -1033,25 +1045,23 @@ const char *
 builtin(const char *name, int (*func) (const char **))
 {
 	struct tbl *tp;
-	uint32_t flag;
+	uint32_t flag = DEFINED;
 
 	/* see if any flags should be set for this builtin */
-	for (flag = 0; ; name++) {
+	while (1) {
 		if (*name == '=')
 			/* command does variable assignment */
 			flag |= KEEPASN;
 		else if (*name == '*')
 			/* POSIX special builtin */
 			flag |= SPEC_BI;
-		else if (*name == '+')
-			/* POSIX regular builtin */
-			flag |= REG_BI;
 		else
 			break;
+		name++;
 	}
 
 	tp = ktenter(&builtins, name, hash(name));
-	tp->flag = DEFINED | flag;
+	tp->flag = flag;
 	tp->type = CSHELL;
 	tp->val.f = func;
 
@@ -1083,7 +1093,7 @@ findcom(const char *name, int flags)
 	tbi = (flags & FC_BI) ? ktsearch(&builtins, name, h) : NULL;
 	/*
 	 * POSIX says special builtins first, then functions, then
-	 * POSIX regular builtins, then search path...
+	 * regular builtins, then search path...
 	 */
 	if ((flags & FC_SPECBI) && tbi && (tbi->flag & SPEC_BI))
 		tp = tbi;
@@ -1098,9 +1108,7 @@ findcom(const char *name, int flags)
 				    &tp->u2.errnov);
 		}
 	}
-	if (!tp && (flags & FC_REGBI) && tbi && (tbi->flag & REG_BI))
-		tp = tbi;
-	if (!tp && (flags & FC_UNREGBI) && tbi)
+	if (!tp && (flags & FC_NORMBI) && tbi)
 		tp = tbi;
 	if (!tp && (flags & FC_PATH) && !(flags & FC_DEFPATH)) {
 		tp = ktsearch(&taliases, name, h);
@@ -1298,10 +1306,11 @@ iosetup(struct ioword *iop, struct tbl *tp)
 	iotmp.name = (iotype == IOHERE) ? NULL : cp;
 	iotmp.flag |= IONAMEXP;
 
-	if (Flag(FXTRACE))
-		shellf("%s%s\n",
-		    substitute(str_val(global("PS4")), 0),
-		    snptreef(NULL, 32, "%R", &iotmp));
+	if (Flag(FXTRACE)) {
+		change_xtrace(2, false);
+		fptreef(shl_xtrace, 0, "%R", &iotmp);
+		change_xtrace(1, false);
+	}
 
 	switch (iotype) {
 	case IOREAD:
@@ -1345,8 +1354,11 @@ iosetup(struct ioword *iop, struct tbl *tp)
 		} else if ((u = check_fd(cp,
 		    X_OK | ((iop->flag & IORDUP) ? R_OK : W_OK),
 		    &emsg)) < 0) {
+			char *sp;
+
 			warningf(true, "%s: %s",
-			    snptreef(NULL, 32, "%R", &iotmp), emsg);
+			    (sp = snptreef(NULL, 32, "%R", &iotmp)), emsg);
+			afree(sp, ATEMP);
 			return (-1);
 		}
 		if (u == iop->unit)
@@ -1361,7 +1373,7 @@ iosetup(struct ioword *iop, struct tbl *tp)
 			warningf(true, "%s: %s", cp, "restricted");
 			return (-1);
 		}
-		u = open(cp, flags, 0666);
+		u = open(cp, flags | O_BINARY, 0666);
 	}
 	if (u < 0) {
 		/* herein() may already have printed message */
@@ -1395,12 +1407,14 @@ iosetup(struct ioword *iop, struct tbl *tp)
 	else if (u != iop->unit) {
 		if (ksh_dup2(u, iop->unit, true) < 0) {
 			int eno;
+			char *sp;
 
 			eno = errno;
 			warningf(true, "%s %s %s",
 			    "can't finish (dup) redirection",
-			    snptreef(NULL, 32, "%R", &iotmp),
+			    (sp = snptreef(NULL, 32, "%R", &iotmp)),
 			    cstrerror(eno));
+			afree(sp, ATEMP);
 			if (iotype != IODUP)
 				close(u);
 			return (-1);
@@ -1492,7 +1506,7 @@ herein(struct ioword *iop, char **resbuf)
 	 * so temp doesn't get removed too soon).
 	 */
 	h = maketemp(ATEMP, TT_HEREDOC_EXP, &e->temps);
-	if (!(shf = h->shf) || (fd = open(h->tffn, O_RDONLY, 0)) < 0) {
+	if (!(shf = h->shf) || (fd = open(h->tffn, O_RDONLY | O_BINARY, 0)) < 0) {
 		i = errno;
 		warningf(true, "can't %s temporary file %s: %s",
 		    !shf ? "create" : "open", h->tffn, cstrerror(i));
@@ -1548,10 +1562,8 @@ do_selectargs(const char **ap, bool print_menu)
 		if (call_builtin(findcom("read", FC_BI), read_args, Tselect))
 			return (NULL);
 		s = str_val(global("REPLY"));
-		if (*s) {
-			getn(s, &i);
+		if (*s && getn(s, &i))
 			return ((i >= 1 && i <= argct) ? ap[i - 1] : null);
-		}
 		print_menu = true;
 	}
 }
@@ -1656,7 +1668,7 @@ static Test_op
 dbteste_isa(Test_env *te, Test_meta meta)
 {
 	Test_op ret = TO_NONOP;
-	int uqword;
+	bool uqword;
 	const char *p;
 
 	if (!*te->pos.wp)

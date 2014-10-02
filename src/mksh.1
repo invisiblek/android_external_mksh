@@ -1,8 +1,8 @@
-.\" $MirOS: src/bin/mksh/mksh.1,v 1.305 2013/02/19 18:45:20 tg Exp $
-.\" $OpenBSD: ksh.1,v 1.145 2013/01/17 21:20:25 jmc Exp $
+.\" $MirOS: src/bin/mksh/mksh.1,v 1.340 2014/07/29 17:26:24 tg Exp $
+.\" $OpenBSD: ksh.1,v 1.152 2014/02/12 16:28:13 schwarze Exp $
 .\"-
 .\" Copyright © 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009,
-.\"		2010, 2011, 2012, 2013
+.\"		2010, 2011, 2012, 2013, 2014
 .\"	Thorsten Glaser <tg@mirbsd.org>
 .\"
 .\" Provided that these terms and disclaimer and all copyright notices
@@ -74,7 +74,7 @@
 .\" with -mandoc, it might implement .Mx itself, but we want to
 .\" use our own definition. And .Dd must come *first*, always.
 .\"
-.Dd $Mdocdate: February 19 2013 $
+.Dd $Mdocdate: July 29 2014 $
 .\"
 .\" Check which macro package we use, and do other -mdoc setup.
 .\"
@@ -157,7 +157,11 @@
 .Nm
 .Bk -words
 .Op Fl +abCefhiklmnprUuvXx
-.Op Fl T Ar /dev/ttyCn \*(Ba \-
+.Oo
+.Fl T Oo Ar \&! Oc Ns Ar tty
+\*(Ba
+.Ar \&\-
+.Oc
 .Op Fl +o Ar option
 .Oo
 .Fl c Ar string \*(Ba
@@ -204,7 +208,7 @@ will execute the command(s) contained in
 .Ar string .
 .It Fl i
 Interactive shell.
-A shell is
+A shell that reads commands from standard input is
 .Dq interactive
 if this
 option is used or if both standard input and standard error are attached
@@ -243,8 +247,7 @@ below.
 Privileged shell.
 A shell is
 .Dq privileged
-if this option is used
-or if the real user ID or group ID does not match the
+if the real user ID or group ID does not match the
 effective user ID or group ID (see
 .Xr getuid 2
 and
@@ -253,6 +256,9 @@ Clearing the privileged option causes the shell to set
 its effective user ID (group ID) to its real user ID (group ID).
 For further implications, see
 .Sx Startup files .
+If the shell is privileged and this flag is not explicitly set, the
+.Dq privileged
+option is cleared automatically after processing the startup files.
 .It Fl r
 Restricted shell.
 A shell is
@@ -295,16 +301,28 @@ Redirections that create files can't be used (i.e.\&
 .It Fl s
 The shell reads commands from standard input; all non-option arguments
 are positional parameters.
-.It Fl T Ar tty
+.It Fl T Ar name
 Spawn
 .Nm
 on the
 .Xr tty 4
 device given.
-Superuser only.
+The paths
+.Ar name ,
+.Pa /dev/ttyC Ns Ar name
+and
+.Pa /dev/tty Ns Ar name
+are attempted in order.
+Unless
+.Ar name
+begins with an exclamation mark
+.Pq Sq \&! ,
+this is done in a subshell and returns immediately.
 If
-.Ar tty
-is a dash, detach from controlling terminal (daemonise) instead.
+.Ar name
+is a dash
+.Pq Sq \&\- ,
+detach from controlling terminal (daemonise) instead.
 .El
 .Pp
 In addition to the above, the options described in the
@@ -350,6 +368,9 @@ parameter after subjecting it to parameter, command, arithmetic and tilde
 substitution; if unset or empty, the user mkshrc profile is processed;
 otherwise, if a file whose name is the substitution result exists,
 it is processed; non-existence is silently ignored.
+A privileged shell then drops privileges if neither was the
+.Fl p
+option given on the command line nor set during execution of the startup files.
 .Ss Command syntax
 The shell begins parsing its input by removing any backslash-newline
 combinations, then breaking it into
@@ -514,7 +535,9 @@ token to form pipelines, in which the standard output of each command but the
 last is piped (see
 .Xr pipe 2 )
 to the standard input of the following command.
-The exit status of a pipeline is that of its last command.
+The exit status of a pipeline is that of its last command, unless the
+.Ic pipefail
+option is set (see there).
 All commands of a pipeline are executed in separate subshells;
 this is allowed by POSIX but differs from both variants of
 .At
@@ -937,7 +960,7 @@ The second operand of the
 .Sq !=
 and
 .Sq =
-expressions are patterns (e.g. the comparison
+expressions are a subset of patterns (e.g. the comparison
 .Ic \&[[ foobar = f*r ]]
 succeeds).
 This even works indirectly:
@@ -949,6 +972,7 @@ $ [[ $bar = \&"$baz" ]]; echo $?
 .Pp
 Perhaps surprisingly, the first comparison succeeds,
 whereas the second doesn't.
+This does not apply to all extglob metacharacters, currently.
 .El
 .El
 .Ss Quoting
@@ -1105,7 +1129,6 @@ nameref=\*(aqtypeset \-n\*(aq
 nohup=\*(aqnohup \*(aq
 r=\*(aqfc \-e \-\*(aq
 stop=\*(aqkill \-STOP\*(aq
-suspend=\*(aqkill \-STOP $$\*(aq
 type=\*(aqwhence \-v\*(aq
 .Ed
 .Pp
@@ -1180,6 +1203,15 @@ work, and in that
 .Ic exit
 terminates the parent shell.
 .Pp
+Another variant of substitution are the valsubs (value substitutions)
+.Pf ${\*(Ba\& Ns Ar command Ns \&;}
+which are also executed in the current environment, like funsubs, but
+share their I/O with the parent; instead, they evaluate to whatever
+the, initially empty, expression-local variable
+.Ev REPLY
+is set to within the
+.Ar command Ns No s .
+.Pp
 If a substitution appears outside of double quotes, the results of the
 substitution are generally subject to word or field splitting according to
 the current value of the
@@ -1200,10 +1232,8 @@ whitespace octets, in combination with zero or one
 whitespace octets, delimit a field.
 As a special case, leading and trailing
 .Ev IFS
-whitespace and trailing
-.Ev IFS
-non-whitespace are stripped (i.e. no leading or trailing empty field
-is created by it); leading
+whitespace is stripped (i.e. no leading or trailing empty field
+is created by it); leading or trailing
 .Pf non- Ev IFS
 whitespace does create an empty field.
 .Pp
@@ -1658,17 +1688,10 @@ Currently,
 must start with a space, opening parenthesis or digit to be recognised.
 Cannot be applied to a vector.
 .Pp
-.It Xo
-.Pf ${ Ar name
-.Pf @# Ns Oo Ar seed Oc Ns }
-.Xc
-The internal hash of the expansion of
-.Ar name ,
-with an optional (defaulting to zero)
-.Op Ar seed .
-At the moment, this is NZAAT (a 32-bit hash based on
-Bob Jenkins' one-at-a-time hash), but this is not set.
-This is the hash the shell uses internally for its associative arrays.
+.It Pf ${ Ns Ar name Ns @#}
+The hash (using the BAFH algorithm) of the expansion of
+.Ar name .
+This is also used internally for the shell's hashtables.
 .Pp
 .It Pf ${ Ns Ar name Ns @Q}
 A quoted expression safe for re-entry, whose value is the value of the
@@ -2010,7 +2033,7 @@ in reverse video
 in the prompt string:
 .Bd -literal -offset indent
 x=$(print \e\e001)
-PS1="$x$(print \e\er)$x$(tput smso)$x\e$PWD$x$(tput rmso)$x\*(Gt "
+PS1="$x$(print \e\er)$x$(tput so)$x\e$PWD$x$(tput se)$x\*(Gt "
 .Ed
 .Pp
 Due to a strong suggestion from David G. Korn,
@@ -2037,6 +2060,9 @@ Parameter, command, and arithmetic substitutions are performed
 before it is printed.
 The default is
 .Sq +\ \& .
+You may want to set it to
+.Sq \&[$EPOCHREALTIME]\ \&
+instead, to include timestamps.
 .It Ev PWD
 The current working directory.
 May be unset or
@@ -2431,6 +2457,13 @@ in
 .Nm
 but a syntax error in GNU
 .Nm bash .
+Setting the
+.Fl o Ar posix
+or
+.Fl o Ar sh
+shell options disable parsing of this redirection;
+it's a compatibility feature to legacy scripts, to
+not be used when writing new shell code.
 .It Xo
 .No &\*(Gt\*(Ba Ar file ,
 .No &\*(Gt\*(Gt Ar file ,
@@ -2515,15 +2548,15 @@ Unary operators:
 Binary operators:
 .Bd -literal -offset indent
 ,
-= *= /= %= += \-= \*(Lt\*(Lt= \*(Gt\*(Gt= &= \*(ha= \*(Ba=
+= += \-= *= /= %= \*(Lt\*(Lt\*(Lt= \*(Gt\*(Gt\*(Gt= \*(Lt\*(Lt= \*(Gt\*(Gt= &= \*(ha= \*(Ba=
 \*(Ba\*(Ba
 &&
 \*(Ba
 \*(ha
 &
 == !=
-\*(Lt \*(Lt= \*(Gt= \*(Gt
-\*(Lt\*(Lt \*(Gt\*(Gt
+\*(Lt \*(Lt= \*(Gt \*(Gt=
+\*(Lt\*(Lt\*(Lt \*(Gt\*(Gt\*(Gt \*(Lt\*(Lt \*(Gt\*(Gt
 + \-
 * / %
 .Ed
@@ -2553,9 +2586,14 @@ Additionally, base-16 integers may be specified by prefixing them with
 in all forms of arithmetic expressions, except as numeric arguments to the
 .Ic test
 built-in command.
-It is discouraged to prefix numbers with a sole zero
-.Pq Sq 0 ,
-because some shells may interpret them as base-8 integers.
+Prefixing numbers with a sole digit zero
+.Pq Sq 0
+leads to the shell interpreting it as base-8 (octal) integer in
+.Ic posix
+mode
+.Em only ;
+historically, (pd)ksh has never done so either anyway,
+and it's unsafe to do that, but POSIX demands it nowadays.
 As a special
 .Nm mksh
 extension, numbers to the base of one are treated as either (8-bit
@@ -2609,8 +2647,8 @@ The result is the value of the expression on the right-hand side.
 .It =
 Assignment; the variable on the left is set to the value on the right.
 .It Xo
-.No *= /= += \-= \*(Lt\*(Lt=
-.No \*(Gt\*(Gt= &= \*(ha= \*(Ba=
+.No += \-= *= /= %= \*(Lt\*(Lt\*(Lt= \*(Gt\*(Gt\*(Gt=
+.No \*(Lt\*(Lt= \*(Gt\*(Gt= &= \*(ha= \*(Ba=
 .Xc
 Assignment operators.
 .Sm off
@@ -2656,19 +2694,30 @@ Not equal; the result is 0 if both arguments are equal, 1 if not.
 .It \*(Lt
 Less than; the result is 1 if the left argument is less than the right, 0 if
 not.
-.It \*(Lt= \*(Gt= \*(Gt
-Less than or equal, greater than or equal, greater than.
+.It \*(Lt= \*(Gt \*(Gt=
+Less than or equal, greater than, greater than or equal.
 See
 .Ic \*(Lt .
+.It \*(Lt\*(Lt\*(Lt \*(Gt\*(Gt\*(Gt
+Rotate left (right); the result is similar to shift (see
+.Ic \*(Lt\*(Lt )
+except that the bits shifted out at one end are shifted in
+at the other end, instead of zero or sign bits.
 .It \*(Lt\*(Lt \*(Gt\*(Gt
 Shift left (right); the result is the left argument with its bits shifted left
 (right) by the amount given in the right argument.
 .It + \- * /
 Addition, subtraction, multiplication, and division.
 .It %
-Remainder; the result is the remainder of the division of the left argument by
-the right.
-The sign of the result is unspecified if either argument is negative.
+Remainder; the result is the symmetric remainder of the division of the left
+argument by the right.
+To get the mathematical modulus of
+.Dq a Ic mod No b ,
+use the formula
+.Do
+.Pq a % b + b
+.No % b
+.Dc .
 .It Xo
 .Sm off
 .Aq Ar arg1 ?
@@ -2682,6 +2731,7 @@ is non-zero, the result is
 .Aq Ar arg2 ;
 otherwise the result is
 .Aq Ar arg3 .
+The non-result argument is not evaluated.
 .El
 .Ss Co-processes
 A co-process (which is a pipeline created with the
@@ -2753,8 +2803,7 @@ However, unlike
 shell arguments (i.e. positional parameters $1, $2, etc.)\&
 are never visible inside them.
 When the shell is determining the location of a command, functions
-are searched after special built-in commands, before regular and
-non-regular built-ins, and before the
+are searched after special built-in commands, before builtins and the
 .Ev PATH
 is searched.
 .Pp
@@ -2868,8 +2917,8 @@ returns.
 .El
 .Ss Command execution
 After evaluation of command-line arguments, redirections, and parameter
-assignments, the type of command is determined: a special built-in, a
-function, a regular built-in, or the name of a file to execute found using the
+assignments, the type of command is determined: a special built-in command,
+a function, a normal builtin, or the name of a file to execute found using the
 .Ev PATH
 parameter.
 The checks are made in the above order.
@@ -2885,46 +2934,31 @@ parameter is not used to find them.
 The original
 .Nm ksh
 and POSIX differ somewhat in which commands are considered
-special or regular:
+special or regular.
 .Pp
-POSIX special commands
+POSIX special built-in utilities:
 .Pp
 .Ic \&. , \&: , break , continue ,
 .Ic eval , exec , exit , export ,
 .Ic readonly , return , set , shift ,
-.Ic trap , unset , wait
+.Ic times , trap , unset
 .Pp
 Additional
 .Nm
-special commands
+commands keeping assignments:
 .Pp
-.Ic builtin , global , times , typeset
+.Ic builtin , global , typeset , wait
 .Pp
-Very special commands
-.Pq non-POSIX
+Builtins that are not special:
 .Pp
-.Ic alias , readonly , set , typeset
-.Pp
-POSIX regular commands
-.Pp
-.Ic alias , bg , cd , command ,
+.Ic [ , alias , bg , bind ,
+.Ic cat , cd , command , echo ,
 .Ic false , fc , fg , getopts ,
-.Ic jobs , kill , read , true ,
-.Ic umask , unalias
-.Pp
-Additional
-.Nm
-regular commands
-.Pp
-.Ic \&[ , chdir , bind , cat ,
-.Ic echo , let , mknod , print ,
-.Ic pwd , realpath , rename , sleep ,
-.Ic test , ulimit , whence
-.Pp
-In the future, the additional
-.Nm
-special and regular commands may be treated
-differently from the POSIX special and regular commands.
+.Ic jobs , kill , let , mknod ,
+.Ic print , pwd , read , realpath ,
+.Ic rename , sleep , suspend , test ,
+.Ic true , ulimit , umask , unalias ,
+.Ic whence
 .Pp
 Once the type of command has been determined, any command-line parameter
 assignments are performed and exported for the duration of the command.
@@ -2951,6 +2985,10 @@ those of the environment the command is used in.
 .It Ic \&: Op Ar ...
 The null command.
 Exit status is set to zero.
+.Pp
+.It Ic \&[ Ar expression Ic \&]
+See
+.Ic test .
 .Pp
 .It Xo Ic alias
 .Oo Fl d \*(Ba t Oo Fl r Oc \*(Ba
@@ -3377,6 +3415,7 @@ and
 .Ar last
 select commands from the history.
 Commands can be selected by history number
+(negative numbers go backwards from the current, most recent, line)
 or a string specifying the most recent command starting with that string.
 The
 .Fl l
@@ -3506,6 +3545,10 @@ resetting
 .Ev OPTIND ,
 may lead to unexpected results.
 .Pp
+.It global Ar ...
+See
+.Ic typeset .
+.Pp
 .It Xo
 .Ic hash
 .Op Fl r
@@ -3584,6 +3627,10 @@ Since expressions may need to be quoted,
 .No \&(( Ar expr No ))
 is syntactic sugar for
 .No let \&" Ns Ar expr Ns \&" .
+.Pp
+.It Ic let]
+Internally used alias for
+.Ic let .
 .Pp
 .It Xo
 .Ic mknod
@@ -3994,6 +4041,12 @@ Only used if job control is enabled
 .It Fl C \*(Ba Fl o Ic noclobber
 Prevent \*(Gt redirection from overwriting existing files.
 Instead, \*(Gt\*(Ba must be used to force an overwrite.
+Note that this is not safe to use for creation of temporary files or
+lockfiles due to a TOCTOU in a check allowing one to redirect output to
+.Pa /dev/null
+or other device files even in
+.Ic noclobber
+mode.
 .It Fl e \*(Ba Fl o Ic errexit
 Exit (after executing the
 .Dv ERR
@@ -4004,11 +4057,14 @@ explicitly tested by a shell construct such as
 .Ic if ,
 .Ic until ,
 .Ic while ,
-.Ic && ,
-.Ic \*(Ba\*(Ba ,
 or
 .Ic !\&
 statements.
+For
+.Ic &&
+or
+.Ic \*(Ba\*(Ba ,
+only the status of the last command is tested.
 .It Fl f \*(Ba Fl o Ic noglob
 Do not expand file name patterns.
 .It Fl h \*(Ba Fl o Ic trackall
@@ -4097,7 +4153,7 @@ Mark directories with a trailing
 .Ql /
 during file name generation.
 .It Fl x \*(Ba Fl o Ic xtrace
-Print commands and parameter assignments when they are executed, preceded by
+Print command trees when they are executed, preceded by
 the value of
 .Ev PS4 .
 .It Fl o Ic bgnice
@@ -4120,6 +4176,11 @@ must be used.
 To avoid infinite loops, the shell will exit if
 .Dv EOF
 is read 13 times in a row.
+.It Fl o Ic inherit\-xtrace
+Do not reset
+.Fl o Ic xtrace
+upon entering functions.
+This is enabled by default.
 .It Fl o Ic nohup
 Do not kill running jobs with a
 .Dv SIGHUP
@@ -4162,6 +4223,9 @@ See the
 and
 .Ic pwd
 commands above for more details.
+.It Fl o Ic pipefail
+Make the exit status of a pipeline (before logically complementing) the
+rightmost non-zero errorlevel, or zero if all commands exited with zero.
 .It Fl o Ic posix
 Enable a somewhat more
 .Px
@@ -4189,6 +4253,9 @@ mode.
 Enable
 .Xr vi 1 Ns -like
 command-line editing (interactive shells only).
+See
+.Sx Vi editing mode
+for documentation and limitations.
 .It Fl o Ic vi\-esccomplete
 In vi command-line editing, do command and file name completion when escape
 (\*(ha[) is entered in command mode.
@@ -4261,6 +4328,16 @@ In
 and
 .Nm mksh ,
 this is implemented as a shell alias instead of a builtin.
+.Pp
+.It Ic suspend
+Stops the shell as if it had received the suspend character from
+the terminal.
+It is not possible to suspend a login shell unless the parent process
+is a member of the same terminal session but is a member of a different
+process group.
+As a general rule, if the shell was started by another shell or via
+.Xr su 1 ,
+it can be suspended.
 .Pp
 .It Ic test Ar expression
 .It Ic \&[ Ar expression Ic \&]
@@ -4825,7 +4902,7 @@ unless they are also given on the same command line.
 .Pp
 .It Xo
 .Ic ulimit
-.Op Fl aBCcdefHiLlMmnOPpqrSsTtVvw
+.Op Fl aBCcdefHilMmnOPpqrSsTtVvw
 .Op Ar value
 .Xc
 Display or set process limits.
@@ -4876,8 +4953,6 @@ Set the hard limit only (the default is to set both hard and soft limits).
 .It Fl i Ar n
 Set the number of pending signals to
 .Ar n .
-.It Fl L Ar n
-Control flocks; documentation is missing.
 .It Fl l Ar n
 Impose a limit of
 .Ar n
@@ -5620,6 +5695,7 @@ replaces the inserted text string with the next previously killed text string.
 .Ss Vi editing mode
 .Em Note:
 The vi command-line editing mode is orphaned, yet still functional.
+It is 8-bit clean but specifically does not support UTF-8 or MBCS.
 .Pp
 The vi command-line editor in
 .Nm
@@ -6020,6 +6096,11 @@ Search for the
 .Ar n Ns th
 occurrence of the last search string;
 the direction of the search is the opposite of the last search.
+.It Ar ANSI-CurUp
+Take the characters from the beginning of the line to the current
+cursor position as search string and do a backwards history search
+for lines beginning with this string; keep the cursor position.
+This works only in insert mode and keeps it enabled.
 .El
 .Pp
 Edit commands
@@ -6249,15 +6330,15 @@ contains the system and suid profile.
 .%A Stephen G. Kochan
 .%A Patrick H. Wood
 .%B "\\*(tNUNIX\\*(sP Shell Programming"
-.%V "Revised Edition"
-.%D 1990
-.%I "Hayden"
-.%P "xi\ +\ 490 pages"
-.%O "ISBN 978\-0\-672\-48448\-3 (0\-672\-48448\-X)"
+.%V "3rd Edition"
+.%D 2003
+.%I "Sams"
+.%P "xiii\ +\ 437 pages"
+.%O "ISBN 978\-0\-672\-32490\-1 (0\-672\-32490\-3)"
 .Re
 .Rs
 .%A "IEEE Inc."
-.%B "\\*(tNIEEE\\*(sP Standard for Information Technology \*(en Portable Operating System Interface (POSIX)"
+.%T "\\*(tNIEEE\\*(sP Standard for Information Technology \*(en Portable Operating System Interface (POSIX)"
 .%V "Part 2: Shell and Utilities"
 .%D 1993
 .%I "IEEE Press"
@@ -6290,40 +6371,83 @@ contains the system and suid profile.
 .%O "ISBN 978\-0\-201\-56324\-5 (0\-201\-56324\-X)"
 .Re
 .Sh AUTHORS
+.An -nosplit
 .Nm "The MirBSD Korn Shell"
 is developed by
 .An Thorsten Glaser Aq tg@mirbsd.org
 and currently maintained as part of The MirOS Project.
-This shell is based upon the Public Domain Korn SHell.
-The developer of mksh recognises the efforts of the pdksh authors,
-who had dedicated their work into Public Domain, our users, and
-all contributors, such as the Debian and OpenBSD projects.
-.\"
-.\" Charles Forsyth, author of the (Public Domain) Bourne Shell clone,
-.\" which mksh is derived from, agreed to the following:
-.\"
-.\" In countries where the Public Domain status of the work may not be
-.\" valid, its primary author hereby grants a copyright licence to the
-.\" general public to deal in the work without restriction and permis-
-.\" sion to sublicence derivates under the terms of any (OSI approved)
-.\" Open Source licence.
-.\"
+This shell is based on the public domain 7th edition Bourne shell clone by
+.An Charles Forsyth ,
+who kindly agreed to, in countries where the Public Domain status of the work
+may not be valid, grant a copyright licence to the general public to deal in
+the work without restriction and permission to sublicence derivates under the
+terms of any (OSI approved) Open Source licence,
+and parts of the BRL shell by
+.An Doug A. Gwyn ,
+.An Doug Kingston ,
+.An Ron Natalie ,
+.An Arnold Robbins ,
+.An Lou Salkind ,
+and others.
+The first release of
+.Nm pdksh
+was created by
+.An Eric Gisin ,
+and it was subsequently maintained by
+.An John R. MacMillan Aq Mt change!john@sq.sq.com ,
+.An Simon J. Gerraty Aq Mt sjg@zen.void.oz.au ,
+and
+.An Michael Rendell Aq Mt michael@cs.mun.ca .
+The effort of several projects, such as Debian and OpenBSD, and other
+contributors including our users, to improve the shell is appreciated.
 See the documentation, CVS, and web site for details.
+.Pp
+The BSD daemon is Copyright \(co Marshall Kirk McKusick.
+The complete legalese is at:
+.Pa https://www.mirbsd.org/TaC\-mksh.txt
+.\"
+.\" This boils down to: feel free to use mksh.ico as application icon
+.\" or shortcut for mksh or mksh/Win32; distro patches are ok (but we
+.\" request they amend $KSH_VERSION when modifying mksh). Authors are
+.\" Marshall Kirk McKusick (UCB), Rick Collette (ekkoBSD), Thorsten
+.\" Glaser, Benny Siegert (MirBSD), Michael Langguth (mksh/Win32).
+.\"
+.\" As far as MirBSD is concerned, the files themselves are free
+.\" to modification and distribution under BSD/MirOS Licence, the
+.\" restriction on use stems only from trademark law's requirement
+.\" to protect it or lose it, which McKusick almost did.
+.\"
 .Sh CAVEATS
 .Nm
 only supports the Unicode BMP (Basic Multilingual Plane).
-It has a different scope model from
+.Pp
+.Nm
+has a different scope model from
 .At
 .Nm ksh ,
 which leads to subtile differences in semantics for identical builtins.
+This can cause issues with a
+.Ic nameref
+to suddenly point to a local variable by accident; fixing this is hard.
 .Pp
 The parts of a pipeline, like below, are executed in subshells.
-Thus, variable assignments inside them fail.
+Thus, variable assignments inside them are not visible in the
+surrounding execution environment.
 Use co-processes instead.
 .Bd -literal -offset indent
 foo \*(Ba bar \*(Ba read baz            # will not change $baz
 foo \*(Ba bar \*(Ba& read \-p baz        # will, however, do so
 .Ed
+.Pp
+.Nm mksh
+provides a consistent set of 32-bit integer arithmetics, both signed
+and unsigned, with defined wraparound and sign of the result of a
+remainder operation, even (defying POSIX) on 64-bit systems.
+If you require 64-bit integer arithmetics, use
+.Nm lksh Pq legacy mksh
+instead, but be aware that, in POSIX, it's legal for the OS to make
+.Li print $((2147483647 + 1))
+delete all files on your system, as it's Undefined Behaviour.
 .Sh BUGS
 Suspending (using \*(haZ) pipelines like the one below will only suspend
 the currently running part of the pipeline; in this example,
@@ -6335,7 +6459,7 @@ $ /bin/sleep 666 && echo fubar
 .Ed
 .Pp
 This document attempts to describe
-.Nm mksh\ R43
+.Nm mksh\ R50
 and up,
 compiled without any options impacting functionality, such as
 .Dv MKSH_SMALL ,

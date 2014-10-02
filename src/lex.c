@@ -1,8 +1,8 @@
-/*	$OpenBSD: lex.c,v 1.46 2013/01/20 14:47:46 stsp Exp $	*/
+/*	$OpenBSD: lex.c,v 1.49 2013/12/17 16:37:06 deraadt Exp $	*/
 
 /*-
  * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
- *		 2011, 2012, 2013
+ *		 2011, 2012, 2013, 2014
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -23,7 +23,7 @@
 
 #include "sh.h"
 
-__RCSID("$MirOS: src/bin/mksh/lex.c,v 1.182 2013/02/19 18:45:20 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/lex.c,v 1.193 2014/06/29 11:28:28 tg Exp $");
 
 /*
  * states while lexing word
@@ -102,8 +102,6 @@ static void gethere(bool);
 static Lex_state *push_state_i(State_info *, Lex_state *);
 static Lex_state *pop_state_i(State_info *, Lex_state *);
 
-static int dopprompt(const char *, int, bool);
-
 static int backslash_skip;
 static int ignore_backslash_newline;
 
@@ -161,9 +159,10 @@ getsc_r(int c)
 	state = statep->type;					\
 } while (/* CONSTCOND */ 0)
 
-#define PUSH_SRETRACE()	do {					\
+#define PUSH_SRETRACE(s) do {					\
 	struct sretrace_info *ri;				\
 								\
+	PUSH_STATE(s);						\
 	statep->ls_start = Xsavepos(ws, wp);			\
 	ri = alloc(sizeof(struct sretrace_info), ATEMP);	\
 	Xinit(ri->xs, ri->xp, 64, ATEMP);			\
@@ -178,6 +177,7 @@ getsc_r(int c)
 	dp = (void *)retrace_info;				\
 	retrace_info = retrace_info->next;			\
 	afree(dp, ATEMP);					\
+	POP_STATE();						\
 } while (/* CONSTCOND */ 0)
 
 /**
@@ -338,7 +338,9 @@ yylex(int cf)
 				}
 				break;
 			case '\'':
- open_ssquote:
+ open_ssquote_unless_heredoc:
+				if ((cf & HEREDOC))
+					goto store_char;
 				*wp++ = OQUOTE;
 				ignore_backslash_newline++;
 				PUSH_STATE(SSQUOTE);
@@ -404,9 +406,8 @@ yylex(int cf)
 					c = getsc();
 					if (c == '(') /*)*/ {
 						*wp++ = EXPRSUB;
-						PUSH_STATE(SASPAREN);
+						PUSH_SRETRACE(SASPAREN);
 						statep->nparen = 2;
-						PUSH_SRETRACE();
 						*retrace_info->xp++ = '(';
 					} else {
 						ungetsc(c);
@@ -421,8 +422,14 @@ yylex(int cf)
 						wp += cz;
 					}
 				} else if (c == '{') /*}*/ {
-					c = getsc();
-					if (ctype(c, C_IFSWS)) {
+					if ((c = getsc()) == '|') {
+						/*
+						 * non-subenvironment
+						 * value substitution
+						 */
+						c = VALSUB;
+						goto subst_command2;
+					} else if (ctype(c, C_IFSWS)) {
 						/*
 						 * non-subenvironment
 						 * "command" substitution
@@ -495,7 +502,8 @@ yylex(int cf)
 							PUSH_STATE(STBRACEKORN);
 					} else {
 						ungetsc(c);
-						if (state == SDQUOTE)
+						if (state == SDQUOTE ||
+						    state == SQBRACE)
 							PUSH_STATE(SQBRACE);
 						else
 							PUSH_STATE(SBRACE);
@@ -616,6 +624,8 @@ yylex(int cf)
 		case SSQUOTE:
 			if (c == '\'') {
 				POP_STATE();
+				if ((cf & HEREDOC) || state == SQBRACE)
+					goto store_char;
 				*wp++ = CQUOTE;
 				ignore_backslash_newline--;
 			} else {
@@ -641,7 +651,6 @@ yylex(int cf)
 				if (statep->nparen == 1) {
 					/* end of EXPRSUB */
 					POP_SRETRACE();
-					POP_STATE();
 
 					if ((c2 = getsc()) == /*(*/ ')') {
 						cz = strlen(sp) - 2;
@@ -693,7 +702,7 @@ yylex(int cf)
 
 		case SBRACE:
 			if (c == '\'')
-				goto open_ssquote;
+				goto open_ssquote_unless_heredoc;
 			else if (c == '\\')
 				goto getsc_qchar;
  common_SQBRACE:
@@ -812,7 +821,7 @@ yylex(int cf)
 				}
 				break;
 			case '\'':
-				goto open_ssquote;
+				goto open_ssquote_unless_heredoc;
 			case '$':
 				if ((c2 = getsc()) == '\'') {
  open_sequote:
@@ -824,8 +833,7 @@ yylex(int cf)
 				} else if (c2 == '"') {
 					/* FALLTHROUGH */
 			case '"':
-					state = statep->type = SHEREDQUOTE;
-					PUSH_SRETRACE();
+					PUSH_SRETRACE(SHEREDQUOTE);
 					break;
 				}
 				ungetsc(c2);
@@ -898,7 +906,11 @@ yylex(int cf)
 		state = SBASE;
 
 	dp = Xstring(ws, wp);
-	if ((c == '<' || c == '>' || c == '&') && state == SBASE) {
+	if (state == SBASE && (
+#ifndef MKSH_LEGACY_MODE
+	    (c == '&' && !Flag(FSH) && !Flag(FPOSIX)) ||
+#endif
+	    c == '<' || c == '>')) {
 		struct ioword *iop = alloc(sizeof(struct ioword), ATEMP);
 
 		if (Xlength(ws, wp) == 0)
@@ -1374,7 +1386,7 @@ getsc_line(Source *s)
 	    Flag(FEMACS) || Flag(FGMACS))) {
 		int nread;
 
-		nread = x_read(xp, LINE);
+		nread = x_read(xp);
 		if (nread < 0)
 			/* read error */
 			nread = 0;
@@ -1427,6 +1439,7 @@ getsc_line(Source *s)
 		alarm(0);
 	}
 	cp = Xstring(s->xs, xp);
+	rndpush(cp);
 	s->start = s->str = cp;
 	strip_nuls(Xstring(s->xs, xp), Xlength(s->xs, xp));
 	/* Note: if input is all nulls, this is not eof */
@@ -1505,12 +1518,13 @@ set_prompt(int to, Source *s)
 	}
 }
 
-static int
-dopprompt(const char *cp, int ntruncate, bool doprint)
+int
+pprompt(const char *cp, int ntruncate)
 {
-	int columns = 0, lines = 0;
-	bool indelimit = false;
 	char delimiter = 0;
+	bool doprint = (ntruncate != -1);
+	bool indelimit = false;
+	int columns = 0, lines = 0;
 
 	/*
 	 * Undocumented AT&T ksh feature:
@@ -1553,19 +1567,6 @@ dopprompt(const char *cp, int ntruncate, bool doprint)
 	if (doprint)
 		shf_flush(shl_out);
 	return (x_cols * lines + columns);
-}
-
-
-void
-pprompt(const char *cp, int ntruncate)
-{
-	dopprompt(cp, ntruncate, true);
-}
-
-int
-promptlen(const char *cp)
-{
-	return (dopprompt(cp, 0, false));
 }
 
 /*

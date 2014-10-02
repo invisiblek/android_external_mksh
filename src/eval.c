@@ -1,8 +1,8 @@
-/*	$OpenBSD: eval.c,v 1.37 2011/10/11 14:32:43 otto Exp $	*/
+/*	$OpenBSD: eval.c,v 1.40 2013/09/14 20:09:30 millert Exp $	*/
 
 /*-
  * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
- *		 2011, 2012, 2013
+ *		 2011, 2012, 2013, 2014
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -23,7 +23,7 @@
 
 #include "sh.h"
 
-__RCSID("$MirOS: src/bin/mksh/eval.c,v 1.136 2013/02/10 23:43:59 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/eval.c,v 1.151 2014/07/29 16:29:11 tg Exp $");
 
 /*
  * string expansion
@@ -33,15 +33,21 @@ __RCSID("$MirOS: src/bin/mksh/eval.c,v 1.136 2013/02/10 23:43:59 tg Exp $");
  */
 
 /* expansion generator state */
-typedef struct Expand {
-	/* int type; */			/* see expand() */
-	const char *str;		/* string */
+typedef struct {
+	/* not including an "int type;" member, see expand() */
+	/* string */
+	const char *str;
+	/* source */
 	union {
-		const char **strv;	/* string[] */
-		struct shf *shf;	/* file */
-	} u;				/* source */
-	struct tbl *var;		/* variable in ${var..} */
-	bool split;			/* split "$@" / call waitlast $() */
+		/* string[] */
+		const char **strv;
+		/* file */
+		struct shf *shf;
+	} u;
+	/* variable in ${var...} */
+	struct tbl *var;
+	/* split "$@" / call waitlast in $() */
+	bool split;
 } Expand;
 
 #define	XBASE		0	/* scanning original */
@@ -59,7 +65,7 @@ typedef struct Expand {
 
 static int varsub(Expand *, const char *, const char *, int *, int *);
 static int comsub(Expand *, const char *, int);
-static void funsub(struct op *);
+static char *valsub(struct op *, Area *);
 static char *trimsub(char *, char *, int);
 static void glob(char *, XPtrV *, bool);
 static void globit(XString *, char **, char *, XPtrV *, int);
@@ -68,7 +74,7 @@ static const char *maybe_expand_tilde(const char *, XString *, char **, int);
 static char *homedir(char *);
 #endif
 static void alt_expand(XPtrV *, char *, char *, char *, int);
-static int utflen(const char *);
+static int utflen(const char *) MKSH_A_PURE;
 static void utfincptr(const char *, mksh_ari_t *);
 
 /* UTFMODE functions */
@@ -198,33 +204,46 @@ typedef struct SubType {
 } SubType;
 
 void
-expand(const char *cp,	/* input word */
-    XPtrV *wp,		/* output words */
-    int f)		/* DO* flags */
+expand(
+    /* input word */
+    const char *ccp,
+    /* output words */
+    XPtrV *wp,
+    /* DO* flags */
+    int f)
 {
 	int c = 0;
-	int type;		/* expansion type */
-	int quote = 0;		/* quoted */
-	XString ds;		/* destination string */
-	char *dp;		/* destination */
-	const char *sp;		/* source */
-	int fdo, word;		/* second pass flags; have word */
-	int doblank;		/* field splitting of parameter/command subst */
+	/* expansion type */
+	int type;
+	/* quoted */
+	int quote = 0;
+	/* destination string and live pointer */
+	XString ds;
+	char *dp;
+	/* source */
+	const char *sp;
+	/* second pass flags */
+	int fdo;
+	/* have word */
+	int word;
+	/* field splitting of parameter/command substitution */
+	int doblank;
+	/* expansion variables */
 	Expand x = {
-		/* expansion variables */
 		NULL, { NULL }, NULL, 0
 	};
 	SubType st_head, *st;
-	/* For trailing newlines in COMSUB */
+	/* record number of trailing newlines in COMSUB */
 	int newlines = 0;
 	bool saw_eq, make_magic;
 	int tilde_ok;
 	size_t len;
+	char *cp;
 
-	if (cp == NULL)
+	if (ccp == NULL)
 		internal_errorf("expand(NULL)");
 	/* for alias, readonly, set, typeset commands */
-	if ((f & DOVACHECK) && is_wdvarassign(cp)) {
+	if ((f & DOVACHECK) && is_wdvarassign(ccp)) {
 		f &= ~(DOVACHECK|DOBLANK|DOGLOB|DOTILDE);
 		f |= DOASNTILDE;
 	}
@@ -238,7 +257,7 @@ expand(const char *cp,	/* input word */
 	/* init destination string */
 	Xinit(ds, dp, 128, ATEMP);
 	type = XBASE;
-	sp = cp;
+	sp = ccp;
 	fdo = 0;
 	saw_eq = false;
 	/* must be 1/0 */
@@ -279,36 +298,35 @@ expand(const char *cp,	/* input word */
 				continue;
 			case COMSUB:
 			case FUNSUB:
+			case VALSUB:
 				tilde_ok = 0;
 				if (f & DONTRUNCOMMAND) {
 					word = IFS_WORD;
 					*dp++ = '$';
-					if (c == FUNSUB) {
-						*dp++ = '{';
-						*dp++ = ' ';
-					} else
-						*dp++ = '(';
+					*dp++ = c == COMSUB ? '(' : '{';
+					if (c != COMSUB)
+						*dp++ = c == FUNSUB ? ' ' : '|';
 					while (*sp != '\0') {
 						Xcheck(ds, dp);
 						*dp++ = *sp++;
 					}
-					if (c == FUNSUB) {
+					if (c != COMSUB) {
 						*dp++ = ';';
 						*dp++ = '}';
 					} else
 						*dp++ = ')';
 				} else {
 					type = comsub(&x, sp, c);
-					if (type == XCOM && (f&DOBLANK))
+					if (type != XBASE && (f & DOBLANK))
 						doblank++;
 					sp = strnul(sp) + 1;
 					newlines = 0;
 				}
 				continue;
 			case EXPRSUB:
-				word = IFS_WORD;
 				tilde_ok = 0;
 				if (f & DONTRUNCOMMAND) {
+					word = IFS_WORD;
 					*dp++ = '$'; *dp++ = '('; *dp++ = '(';
 					while (*sp != '\0') {
 						Xcheck(ds, dp);
@@ -317,7 +335,6 @@ expand(const char *cp,	/* input word */
 					*dp++ = ')'; *dp++ = ')';
 				} else {
 					struct tbl v;
-					char *p;
 
 					v.flag = DEFINED|ISSET|INTEGER;
 					/* not default */
@@ -326,10 +343,10 @@ expand(const char *cp,	/* input word */
 					v_evaluate(&v, substitute(sp, 0),
 					    KSH_UNWIND_ERROR, true);
 					sp = strnul(sp) + 1;
-					for (p = str_val(&v); *p; ) {
-						Xcheck(ds, dp);
-						*dp++ = *p++;
-					}
+					x.str = str_val(&v);
+					type = XSUB;
+					if (f & DOBLANK)
+						doblank++;
 				}
 				continue;
 			case OSUBST: {
@@ -395,29 +412,10 @@ expand(const char *cp,	/* input word */
 						sp += slen;
 					switch (stype & 0x17F) {
 					case 0x100 | '#':
-					    {
-						char *beg, *end;
-						mksh_ari_t seed;
-						register uint32_t h;
-
-						beg = wdcopy(sp, ATEMP);
-						end = beg + (wdscan(sp, CSUBST) - sp);
-						end[-2] = EOS;
-						end = wdstrip(beg, 0);
-						afree(beg, ATEMP);
-						evaluate(substitute(end, 0),
-						    &seed, KSH_UNWIND_ERROR, true);
-						/* hash with seed, for now */
-						h = seed;
-						NZATUpdateString(h,
-						    str_val(st->var));
-						NZAATFinish(h);
 						x.str = shf_smprintf("%08X",
-						    (unsigned int)h);
+						    (unsigned int)hash(str_val(st->var)));
 						break;
-					}
-					case 0x100 | 'Q':
-					    {
+					case 0x100 | 'Q': {
 						struct shf shf;
 
 						shf_sopen(NULL, 0, SHF_WR|SHF_DYNAMIC, &shf);
@@ -684,7 +682,7 @@ expand(const char *cp,	/* input word */
 				*dp = '\0';
 				quote = st->quotep;
 				f = st->f;
-				if (f&DOBLANK)
+				if (f & DOBLANK)
 					doblank--;
 				switch (st->stype & 0x17F) {
 				case '#':
@@ -703,11 +701,12 @@ expand(const char *cp,	/* input word */
 					 */
 					x.str = trimsub(str_val(st->var),
 						dp, st->stype);
-					if (x.str[0] != '\0' || st->quotep)
+					if (x.str[0] != '\0') {
+						word = IFS_WS;
 						type = XSUB;
-					else
-						type = XNULLSUB;
-					if (f&DOBLANK)
+					} else
+						type = quote ? XSUB : XNULLSUB;
+					if (f & DOBLANK)
 						doblank++;
 					st = st->prev;
 					continue;
@@ -739,7 +738,7 @@ expand(const char *cp,	/* input word */
 					    dp, len), KSH_UNWIND_ERROR);
 					x.str = str_val(st->var);
 					type = XSUB;
-					if (f&DOBLANK)
+					if (f & DOBLANK)
 						doblank++;
 					st = st->prev;
 					continue;
@@ -757,7 +756,7 @@ expand(const char *cp,	/* input word */
 				case 0x100 | 'Q':
 					dp = Xrestpos(ds, dp, st->base);
 					type = XSUB;
-					if (f&DOBLANK)
+					if (f & DOBLANK)
 						doblank++;
 					st = st->prev;
 					continue;
@@ -794,12 +793,14 @@ expand(const char *cp,	/* input word */
 			 * other stuff inside the quotes).
 			 */
 			type = XBASE;
-			if (f&DOBLANK) {
+			if (f & DOBLANK) {
 				doblank--;
 				/*
-				 * not really correct: x=; "$x$@" should
-				 * generate a null argument and
-				 * set A; "${@:+}" shouldn't.
+				 * XXX not really correct:
+				 *	x=; "$x$@"
+				 * should generate a null argument and
+				 *	set A; "${@:+}"
+				 * shouldn't.
 				 */
 				if (dp == Xstring(ds, dp))
 					word = IFS_WS;
@@ -810,7 +811,7 @@ expand(const char *cp,	/* input word */
 		case XSUBMID:
 			if ((c = *x.str++) == 0) {
 				type = XBASE;
-				if (f&DOBLANK)
+				if (f & DOBLANK)
 					doblank--;
 				continue;
 			}
@@ -831,7 +832,7 @@ expand(const char *cp,	/* input word */
 					word = IFS_WORD;
 				if ((x.str = *x.u.strv++) == NULL) {
 					type = XBASE;
-					if (f&DOBLANK)
+					if (f & DOBLANK)
 						doblank--;
 					continue;
 				}
@@ -839,7 +840,10 @@ expand(const char *cp,	/* input word */
 				if (c == 0) {
 					if (quote && !x.split)
 						continue;
+					/* this is so we don't terminate */
 					c = ' ';
+					/* now force-emit a word */
+					goto emit_word;
 				}
 				if (quote && x.split) {
 					/* terminate word for "$@" */
@@ -850,14 +854,19 @@ expand(const char *cp,	/* input word */
 			break;
 
 		case XCOM:
-			if (newlines) {
-				/* Spit out saved NLs */
+			if (x.u.shf == NULL) {
+				/* $(<...) failed */
+				subst_exstat = 1;
+				/* fake EOF */
+				c = EOF;
+			} else if (newlines) {
+				/* spit out saved NLs */
 				c = '\n';
 				--newlines;
 			} else {
 				while ((c = shf_getc(x.u.shf)) == 0 || c == '\n')
 					if (c == '\n')
-						/* Save newlines */
+						/* save newlines */
 						newlines++;
 				if (newlines && c != EOF) {
 					shf_ungetc(c, x.u.shf);
@@ -867,11 +876,12 @@ expand(const char *cp,	/* input word */
 			}
 			if (c == EOF) {
 				newlines = 0;
-				shf_close(x.u.shf);
+				if (x.u.shf)
+					shf_close(x.u.shf);
 				if (x.split)
 					subst_exstat = waitlast();
 				type = XBASE;
-				if (f&DOBLANK)
+				if (f & DOBLANK)
 					doblank--;
 				continue;
 			}
@@ -887,29 +897,29 @@ expand(const char *cp,	/* input word */
 			 *	word		|	ws	nws	0
 			 *	-----------------------------------
 			 *	IFS_WORD		w/WS	w/NWS	w
-			 *	IFS_WS			-/WS	w/NWS	-
-			 *	IFS_NWS			-/NWS	w/NWS	w
+			 *	IFS_WS			-/WS	-/NWS	-
+			 *	IFS_NWS			-/NWS	w/NWS	-
 			 * (w means generate a word)
 			 * Note that IFS_NWS/0 generates a word (AT&T ksh
 			 * doesn't do this, but POSIX does).
 			 */
 			if (word == IFS_WORD ||
-			    (!ctype(c, C_IFSWS) && c && word == IFS_NWS)) {
-				char *p;
-
+			    (word == IFS_NWS && c && !ctype(c, C_IFSWS))) {
+ emit_word:
 				*dp++ = '\0';
-				p = Xclose(ds, dp);
+				cp = Xclose(ds, dp);
 				if (fdo & DOBRACE)
 					/* also does globbing */
-					alt_expand(wp, p, p,
-					    p + Xlength(ds, (dp - 1)),
+					alt_expand(wp, cp, cp,
+					    cp + Xlength(ds, (dp - 1)),
 					    fdo | (f & DOMARKDIRS));
 				else if (fdo & DOGLOB)
-					glob(p, wp, tobool(f & DOMARKDIRS));
+					glob(cp, wp, tobool(f & DOMARKDIRS));
 				else if ((f & DOPAT) || !(fdo & DOMAGIC))
-					XPput(*wp, p);
+					XPput(*wp, cp);
 				else
-					XPput(*wp, debunk(p, p, strlen(p) + 1));
+					XPput(*wp, debunk(cp, cp,
+					    strlen(cp) + 1));
 				fdo = 0;
 				saw_eq = false;
 				tilde_ok = (f & (DOTILDE|DOASNTILDE)) ? 1 : 0;
@@ -920,10 +930,8 @@ expand(const char *cp,	/* input word */
 				return;
 			} else if (type == XSUB && ctype(c, C_IFS) &&
 			    !ctype(c, C_IFSWS) && Xlength(ds, dp) == 0) {
-				char *p;
-
-				*(p = alloc(1, ATEMP)) = '\0';
-				XPput(*wp, p);
+				*(cp = alloc(1, ATEMP)) = '\0';
+				XPput(*wp, cp);
 				type = XSUBMID;
 			}
 			if (word != IFS_NWS)
@@ -932,10 +940,8 @@ expand(const char *cp,	/* input word */
 			if (type == XSUB) {
 				if (word == IFS_NWS &&
 				    Xlength(ds, dp) == 0) {
-					char *p;
-
-					*(p = alloc(1, ATEMP)) = '\0';
-					XPput(*wp, p);
+					*(cp = alloc(1, ATEMP)) = '\0';
+					XPput(*wp, cp);
 				}
 				type = XSUBMID;
 			}
@@ -1002,18 +1008,17 @@ expand(const char *cp,	/* input word */
 					if (type == XBASE &&
 					    (f & (DOTILDE|DOASNTILDE)) &&
 					    (tilde_ok & 2)) {
-						const char *p;
-						char *dp_x;
+						const char *tcp;
+						char *tdp = dp;
 
-						dp_x = dp;
-						p = maybe_expand_tilde(sp,
-						    &ds, &dp_x,
+						tcp = maybe_expand_tilde(sp,
+						    &ds, &tdp,
 						    f & DOASNTILDE);
-						if (p) {
-							if (dp != dp_x)
+						if (tcp) {
+							if (dp != tdp)
 								word = IFS_WORD;
-							dp = dp_x;
-							sp = p;
+							dp = tdp;
+							sp = tcp;
 							continue;
 						}
 					}
@@ -1176,8 +1181,10 @@ varsub(Expand *xp, const char *sp, const char *word,
 	c = sp[0];
 	if (c == '*' || c == '@') {
 		switch (stype & 0x17F) {
-		case '=':	/* can't assign to a vector */
-		case '%':	/* can't trim a vector (yet) */
+		/* can't assign to a vector */
+		case '=':
+		/* can't trim a vector (yet) */
+		case '%':
 		case '#':
 		case '0':
 		case '/':
@@ -1204,8 +1211,10 @@ varsub(Expand *xp, const char *sp, const char *word,
 			XPtrV wv;
 
 			switch (stype & 0x17F) {
-			case '=':	/* can't assign to a vector */
-			case '%':	/* can't trim a vector (yet) */
+			/* can't assign to a vector */
+			case '=':
+			/* can't trim a vector (yet) */
+			case '%':
 			case '#':
 			case '?':
 			case '0':
@@ -1245,17 +1254,12 @@ varsub(Expand *xp, const char *sp, const char *word,
 			if (*sp == '!' && sp[1]) {
 				++sp;
 				xp->var = global(sp);
-				if (vstrchr(sp, '[')) {
-					if (xp->var->flag & ISSET)
-						xp->str = shf_smprintf("%lu",
-						    arrayindex(xp->var));
-					else
-						xp->str = null;
-				} else if (xp->var->flag & ISSET)
-					xp->str = xp->var->name;
+				if (vstrchr(sp, '['))
+					xp->str = shf_smprintf("%s[%lu]",
+					    xp->var->name,
+					    arrayindex(xp->var));
 				else
-					/* ksh93 compat */
-					xp->str = "0";
+					xp->str = xp->var->name;
 			} else {
 				xp->var = global(sp);
 				xp->str = str_val(xp->var);
@@ -1317,33 +1321,41 @@ comsub(Expand *xp, const char *cp, int fn MKSH_A_UNUSED)
 		shf = shf_open(name = evalstr(io->name, DOTILDE), O_RDONLY, 0,
 			SHF_MAPHI|SHF_CLEXEC);
 		if (shf == NULL)
-			errorf("%s: %s %s", name, "can't open", "$() input");
+			warningf(!Flag(FTALKING), "%s: %s %s: %s", name,
+			    "can't open", "$(<...) input", cstrerror(errno));
 	} else if (fn == FUNSUB) {
 		int ofd1;
 		struct temp *tf = NULL;
 
-		/* create a temporary file, open for writing */
+		/*
+		 * create a temporary file, open for reading and writing,
+		 * with an shf open for reading (buffered) but yet unused
+		 */
 		maketemp(ATEMP, TT_FUNSUB, &tf);
 		if (!tf->shf) {
 			errorf("can't %s temporary file %s: %s",
 			    "create", tf->tffn, cstrerror(errno));
 		}
-		/* save stdout and make the temporary file it */
+		/* extract shf from temporary file, unlink and free it */
+		shf = tf->shf;
+		unlink(tf->tffn);
+		afree(tf, ATEMP);
+		/* save stdout and let it point to the tempfile */
 		ofd1 = savefd(1);
-		ksh_dup2(shf_fileno(tf->shf), 1, false);
+		ksh_dup2(shf_fileno(shf), 1, false);
 		/*
 		 * run tree, with output thrown into the tempfile,
 		 * in a new function block
 		 */
-		funsub(t);
+		valsub(t, NULL);
 		subst_exstat = exstat & 0xFF;
-		/* close the tempfile and restore regular stdout */
-		shf_close(tf->shf);
+		/* rewind the tempfile and restore regular stdout */
+		lseek(shf_fileno(shf), (off_t)0, SEEK_SET);
 		restfd(1, ofd1);
-		/* now open, unlink and free the tempfile for reading */
-		shf = shf_open(tf->tffn, O_RDONLY, 0, SHF_MAPHI | SHF_CLEXEC);
-		unlink(tf->tffn);
-		afree(tf, ATEMP);
+	} else if (fn == VALSUB) {
+		xp->str = valsub(t, ATEMP);
+		subst_exstat = exstat & 0xFF;
+		return (XSUB);
 	} else {
 		int ofd1, pv[2];
 
@@ -1495,11 +1507,11 @@ globit(XString *xs,	/* dest string */
 		 */
 		if ((check & GF_EXCHECK) ||
 		    ((check & GF_MARKDIR) && (check & GF_GLOBBED))) {
-#define stat_check()	(stat_done ? stat_done : \
-			    (stat_done = stat(Xstring(*xs, xp), &statb) < 0 \
-				? -1 : 1))
+#define stat_check()	(stat_done ? stat_done : (stat_done = \
+			    stat(Xstring(*xs, xp), &statb) < 0 ? -1 : 1))
 			struct stat lstatb, statb;
-			int stat_done = 0;	 /* -1: failed, 1 ok */
+			/* -1: failed, 1 ok, 0 not yet done */
+			int stat_done = 0;
 
 			if (mksh_lstat(Xstring(*xs, xp), &lstatb) < 0)
 				return;
@@ -1801,12 +1813,21 @@ alt_expand(XPtrV *wp, char *start, char *exp_start, char *end, int fdo)
 }
 
 /* helper function due to setjmp/longjmp woes */
-static void
-funsub(struct op *t)
+static char *
+valsub(struct op *t, Area *ap)
 {
+	char * volatile cp = NULL;
+	struct tbl * volatile vp = NULL;
+
+	newenv(E_FUNC);
 	newblock();
-	e->type = E_FUNC;
+	if (ap)
+		vp = local("REPLY", false);
 	if (!kshsetjmp(e->jbuf))
 		execute(t, XXCOM | XERROK, NULL);
-	popblock();
+	if (vp)
+		strdupx(cp, str_val(vp), ap);
+	quitenv(NULL);
+
+	return (cp);
 }

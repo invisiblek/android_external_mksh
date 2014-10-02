@@ -1,7 +1,8 @@
-/*	$OpenBSD: jobs.c,v 1.38 2009/12/12 04:28:44 deraadt Exp $	*/
+/*	$OpenBSD: jobs.c,v 1.40 2013/09/04 15:49:18 millert Exp $	*/
 
 /*-
- * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2011, 2012
+ * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2011,
+ *		 2012, 2013, 2014
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -22,7 +23,7 @@
 
 #include "sh.h"
 
-__RCSID("$MirOS: src/bin/mksh/jobs.c,v 1.94 2012/12/28 02:28:36 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/jobs.c,v 1.104 2014/06/10 22:17:09 tg Exp $");
 
 #if HAVE_KILLPG
 #define mksh_killpg		killpg
@@ -44,12 +45,11 @@ struct proc {
 	int state;
 	int status;		/* wait status */
 	/* process command string from vistree */
-	char command[64 - (ALLOC_SIZE + sizeof(Proc *) + sizeof(pid_t) +
+	char command[256 - (ALLOC_SIZE + sizeof(Proc *) + sizeof(pid_t) +
 	    2 * sizeof(int))];
 };
 
 /* Notify/print flag - j_print() argument */
-#define JP_NONE		0	/* don't print anything */
 #define JP_SHORT	1	/* print signals processes were killed by */
 #define JP_MEDIUM	2	/* print [job-num] -/+ command */
 #define JP_LONG		3	/* print [job-num] -/+ pid command */
@@ -102,17 +102,14 @@ struct job {
 #define JW_PIPEST	0x08	/* want PIPESTATUS */
 
 /* Error codes for j_lookup() */
-#define JL_OK		0
-#define JL_NOSUCH	1	/* no such job */
-#define JL_AMBIG	2	/* %foo or %?foo is ambiguous */
-#define JL_INVALID	3	/* non-pid, non-% job id */
+#define JL_NOSUCH	0	/* no such job */
+#define JL_AMBIG	1	/* %foo or %?foo is ambiguous */
+#define JL_INVALID	2	/* non-pid, non-% job id */
 
 static const char * const lookup_msgs[] = {
-	null,
 	"no such job",
 	"ambiguous",
-	"argument must be %job or process id",
-	NULL
+	"argument must be %job or process id"
 };
 
 static Job *job_list;		/* job list */
@@ -227,6 +224,54 @@ proc_errorlevel(Proc *p)
 		return (0);
 	}
 }
+
+#if !defined(MKSH_UNEMPLOYED) && HAVE_GETSID
+/* suspend the shell */
+void
+j_suspend(void)
+{
+	struct sigaction sa, osa;
+
+	/* Restore tty and pgrp. */
+	if (ttypgrp_ok) {
+		if (tty_hasstate)
+			mksh_tcset(tty_fd, &tty_state);
+		if (restore_ttypgrp >= 0) {
+			if (tcsetpgrp(tty_fd, restore_ttypgrp) < 0) {
+				warningf(false, "%s: %s %s: %s", "j_suspend",
+				    "tcsetpgrp", "failed", cstrerror(errno));
+			} else if (setpgid(0, restore_ttypgrp) < 0) {
+				warningf(false, "%s: %s %s: %s", "j_suspend",
+				    "setpgid", "failed", cstrerror(errno));
+			}
+		}
+	}
+
+	/* Suspend the shell. */
+	memset(&sa, 0, sizeof(sa));
+	sigemptyset(&sa.sa_mask);
+	sa.sa_handler = SIG_DFL;
+	sigaction(SIGTSTP, &sa, &osa);
+	kill(0, SIGTSTP);
+
+	/* Back from suspend, reset signals, pgrp and tty. */
+	sigaction(SIGTSTP, &osa, NULL);
+	if (ttypgrp_ok) {
+		if (restore_ttypgrp >= 0) {
+			if (setpgid(0, kshpid) < 0) {
+				warningf(false, "%s: %s %s: %s", "j_suspend",
+				    "setpgid", "failed", cstrerror(errno));
+				ttypgrp_ok = false;
+			} else if (tcsetpgrp(tty_fd, kshpid) < 0) {
+				warningf(false, "%s: %s %s: %s", "j_suspend",
+				    "tcsetpgrp", "failed", cstrerror(errno));
+				ttypgrp_ok = false;
+			}
+		}
+		tty_init_state();
+	}
+}
+#endif
 
 /* job cleanup before shell exit */
 void
@@ -463,7 +508,7 @@ exchild(struct op *t, int flags,
 		forksleep <<= 1;
 	}
 	/* ensure $RANDOM changes between parent and child */
-	rndset((long)cldpid);
+	rndset((unsigned long)cldpid);
 	/* fork failed? */
 	if (cldpid < 0) {
 		kill_job(j, SIGKILL);
@@ -506,9 +551,6 @@ exchild(struct op *t, int flags,
 		/* Do this before restoring signal */
 		if (flags & XCOPROC)
 			coproc_cleanup(false);
-#ifndef MKSH_NOPROSPECTOFWORK
-		sigprocmask(SIG_SETMASK, &omask, NULL);
-#endif
 		cleanup_parents_env();
 #ifndef MKSH_UNEMPLOYED
 		/*
@@ -543,6 +585,10 @@ exchild(struct op *t, int flags,
 		}
 		/* in case of $(jobs) command */
 		remove_job(j, "child");
+#ifndef MKSH_NOPROSPECTOFWORK
+		/* remove_job needs SIGCHLD blocked still */
+		sigprocmask(SIG_SETMASK, &omask, NULL);
+#endif
 		nzombie = 0;
 #ifndef MKSH_UNEMPLOYED
 		ttypgrp_ok = false;
@@ -906,7 +952,7 @@ j_jobs(const char *cp, int slp,
 		zflag = 1;
 	}
 	if (cp) {
-		int	ecode;
+		int ecode;
 
 		if ((j = j_lookup(cp, &ecode)) == NULL) {
 #ifndef MKSH_NOPROSPECTOFWORK
@@ -1220,6 +1266,17 @@ j_waitj(Job *j,
 			    ARRAY | INT_U | AINDEX;
  got_array:
 			vp->val.i = proc_errorlevel(p);
+			if (Flag(FPIPEFAIL) && vp->val.i)
+				rv = vp->val.i;
+			p = p->next;
+		}
+	} else if (Flag(FPIPEFAIL) && (j->proc_list != NULL)) {
+		Proc *p = j->proc_list;
+		int i;
+
+		while (p != NULL) {
+			if ((i = proc_errorlevel(p)))
+				rv = i;
 			p = p->next;
 		}
 	}
@@ -1251,8 +1308,7 @@ j_waitj(Job *j,
 static void
 j_sigchld(int sig MKSH_A_UNUSED)
 {
-	/* this runs inside interrupt context, with errno saved */
-
+	int saved_errno = errno;
 	Job *j;
 	Proc *p = NULL;
 	pid_t pid;
@@ -1282,7 +1338,11 @@ j_sigchld(int sig MKSH_A_UNUSED)
 	getrusage(RUSAGE_CHILDREN, &ru0);
 	do {
 #ifndef MKSH_NOPROSPECTOFWORK
-		pid = waitpid(-1, &status, (WNOHANG|WUNTRACED));
+		pid = waitpid(-1, &status, (WNOHANG |
+#ifdef WCONTINUED
+		    WCONTINUED |
+#endif
+		    WUNTRACED));
 #else
 		pid = wait(&status);
 #endif
@@ -1321,6 +1381,13 @@ j_sigchld(int sig MKSH_A_UNUSED)
 		if (WIFSTOPPED(status))
 			p->state = PSTOPPED;
 		else
+#ifdef WIFCONTINUED
+		  if (WIFCONTINUED(status)) {
+			p->state = j->state = PRUNNING;
+			/* skip check_job(), no-op in this case */
+			continue;
+		} else
+#endif
 #endif
 		  if (WIFSIGNALED(status))
 			p->state = PSIGNALLED;
@@ -1340,7 +1407,7 @@ j_sigchld(int sig MKSH_A_UNUSED)
 #ifdef MKSH_NO_SIGSUSPEND
 	sigprocmask(SIG_SETMASK, &omask, NULL);
 #endif
-	/* nothing */;
+	errno = saved_errno;
 }
 
 /*
